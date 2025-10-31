@@ -1,0 +1,26 @@
+Water Contact Angle
+
+Environment:
+There's a glass plate having a microscope camera at one side and LED lihts on the other side.
+And on that glass plate water drop's images will be captured
+
+I need to work:
+- Make a software to Find out angle of the water droplet by drawing perpendicular on 
+  both the sides of droplet (where the droplet ends)
+- After we get the angle need to apply formula to find out wether it's hydrophobic or philic
+- Also need to keep an threshold while capturing through microscope that if the alignment of 
+  droplet and microscope is not proper it will not capture the data at all (this will be 
+  applied later on, once the above 2 priority tasks are completed)
+
+
+Improvements to be done:
+- Create baseline from 1st 2 points (p1, p2) and extending it.
+- Now once te baseline is drawn, draw perpendicular on those points (p1, p2) and then mark 
+  the other 2 points (p3, p4).
+- Draw lines of p3 and p4 and calulate the angle between p1-p3 and p2-p4.
+
+
+New:
+- Angle is to be done from the baseline and not perpendicular.
+- Draw line of p3 and p4 instead of points.
+- zoom in - zoom out option for images.
