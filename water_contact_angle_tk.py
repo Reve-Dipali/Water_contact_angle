@@ -1,18 +1,9 @@
-#!/usr/bin/env python3
-"""
-Water Contact Angle - automatic baseline (Canny + Hough) + manual 4-point tangents
-Fixed manual tangent toggle, improved baseline detector, fixed overlay/save bugs.
-Save as: water_contact_angle_auto_baseline_fixed.py
-Requires: opencv-python, pillow, numpy
-Run: python water_contact_angle_auto_baseline_fixed.py
-"""
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, Menu, Toplevel, Label
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 import numpy as np
-import cv2
-import os
-import math
+import cv2, os, math
+from capture_ui import CaptureTabUI
 
 class ContactAngleApp(tk.Tk):
     def __init__(self):
@@ -20,94 +11,160 @@ class ContactAngleApp(tk.Tk):
         self.title("Water Contact Angle - Auto Baseline (Canny+Hough) - FIXED")
         self.geometry("1100x720")
         self.configure(bg="#f4f4f4")
-
-        # State
-        self.orig_image = None       # PIL Image (original, RGB)
-        self.cv_image = None         # OpenCV BGR image (numpy)
-        self.display_image = None    # PIL Image (resized for canvas)
+        
+        # ---------- STATE ----------
+        self.orig_image = None
+        self.cv_image = None
+        self.display_image = None
         self.tk_image = None
         self.scale = 1.0
         self.offset = (0, 0)
-        self.points = []             # will store up to 4 points [(x,y), ...] in image coords
-        self.baseline = None         # (x1,y1,x2,y2) in image coords
-        self.last_result = None      # dict with 'left' and/or 'right' entries
-
-        # ---------- FIXED GRID LAYOUT ----------
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=0)  # control panel fixed width
-        self.grid_columnconfigure(1, weight=1)  # image canvas expands
-
-        control_frame = tk.Frame(self, bg="#ffffff", padx=8, pady=8, width=300)
-        control_frame.grid(row=0, column=0, sticky="nswe")
-        control_frame.grid_propagate(False)
-
-        btn_load = tk.Button(control_frame, text="Load Image", command=self.load_image, width=28)
-        btn_load.pack(pady=(0,8))
-
-        instr = ("Instructions:\n"
-                 "1) Load image (glass near bottom recommended)\n"
-                 "2) Click 4 points in order:\n"
-                 "   P1 = Left contact (touching glass)\n"
-                 "   P2 = Right contact\n"
-                 "   P3 = Left curve (near contact, on droplet edge)\n"
-                 "   P4 = Right curve\n"
-                 "3) Either click 'Compute Angle' or it will auto-compute after 4 clicks.\n"
-                 "4) You can draw tangents manually using Manual Tangent Mode (draw left then right).")
-        tk.Label(control_frame, text=instr, justify="left", bg="#ffffff", wraplength=280).pack(pady=(0,8))
-
-        btn_reset = tk.Button(control_frame, text="Reset Points", command=self.reset_points, width=28)
-        btn_reset.pack(pady=4)
-
-        btn_detect_baseline = tk.Button(control_frame, text="Detect Baseline (Auto)", command=self.detect_baseline_auto, width=28)
-        btn_detect_baseline.pack(pady=4)
-
-        btn_compute = tk.Button(control_frame, text="Compute Angle", command=self.compute_angle, width=28)
-        btn_compute.pack(pady=4)
-
-        btn_adjust_baseline = tk.Button(control_frame, text="Adjust Baseline (Manual)", command=self.toggle_baseline_adjust, width=28)
-        btn_adjust_baseline.pack(pady=4)
-
-        btn_tangent_mode = tk.Button(control_frame, text="Manual Tangent Mode (Draw)", command=self.toggle_tangent_mode, width=28)
-        btn_tangent_mode.pack(pady=4)
-
+        self.points = []
+        self.annotations = {}
+        self.baseline = None
+        self.last_result = None
+        self.tangent_lines = {}
+        self.manual_tangent_mode = False
         self.adjusting_baseline = False
-        self.baseline_points = []  # will hold 2 points for manual baseline
+        self.baseline_points = []
+        self.manual_baseline_mode = False
+        self.baseline_line = None
 
-        btn_save = tk.Button(control_frame, text="Save Annotated Image", command=self.save_annotated, width=28)
-        btn_save.pack(pady=4)
+        # ---------- ZOOM / PAN STATE ----------
+        self.user_panned = False
+        self._drag_start = None
+        self._rendering = False
 
-        # --- Zoom Controls ---
-        zoom_frame = tk.Frame(control_frame, bg="lightgray")
-        zoom_frame.pack(pady=(5, 0))
-        tk.Button(zoom_frame, text="🔍 Zoom In (+)", command=lambda: self.zoom(1.25)).pack(side=tk.LEFT, padx=2)
-        tk.Button(zoom_frame, text="🔎 Zoom Out (-)", command=lambda: self.zoom(0.8)).pack(side=tk.LEFT, padx=2)
+        # ---------- MENU BAR ----------
+        menubar = tk.Menu(self)
+        self.config(menu=menubar)
 
-        # Results area
-        self.result_label = tk.Label(control_frame, text="Left Angle: —\nRight Angle: —", bg="#ffffff", font=("Arial", 11))
-        self.result_label.pack(pady=(18,0))
+        # File Menu
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="📁 Load Image", command=self.load_image)
+        file_menu.add_command(label="🎞️ Load Video", command=self.load_video)
+        file_menu.add_command(label="💾 Save Annotated Image", command=self.save_annotated)
+        menubar.add_cascade(label="File", menu=file_menu)
 
-        self.status_label = tk.Label(control_frame, text="Points: 0/4", bg="#ffffff")
-        self.status_label.pack(pady=(8,0))
+        # Zoom Menu
+        zoom_menu = tk.Menu(menubar, tearoff=0)
+        zoom_menu.add_command(label="Zoom In", command=lambda: self.zoom(1.25))
+        zoom_menu.add_command(label="Zoom Out", command=lambda: self.zoom(0.8))
+        menubar.add_cascade(label="Zoom", menu=zoom_menu)
 
-        # Canvas for image
-        canvas_frame = tk.Frame(self, bg="#000")
+        # Auto Menu
+        auto_menu = tk.Menu(menubar, tearoff=0)
+        auto_menu.add_command(label="Reset Image View", command=self.reset_image_view)
+        auto_menu.add_command(label="Reset Points", command=self.reset_points)
+        auto_menu.add_command(label="Detect Baseline (Auto)", command=self.detect_baseline_auto)
+        menubar.add_cascade(label="Auto", menu=auto_menu)
+
+        # Manual Menu
+        manual_menu = tk.Menu(menubar, tearoff=0)
+        manual_menu.add_command(label="Draw Manual Baseline", command=self.enable_manual_baseline_draw)
+        manual_menu.add_command(label="Manual Tangent Mode", command=self.toggle_tangent_mode)
+        menubar.add_cascade(label="Manual", menu=manual_menu)
+
+        # Help Menu
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(
+            label="📘 Instructions",
+            command=lambda: messagebox.showinfo(
+                "Instructions",
+                "1️⃣ Load or open camera to capture droplet image.\n"
+                "2️⃣ Adjust or detect baseline.\n"
+                "3️⃣ Add tangent points or draw tangents manually.\n"
+                "4️⃣ Compute contact angles.\n"
+                "5️⃣ Use zoom and move tools for detailed viewing.\n"
+                "6️⃣ Save annotated image from File → Save Annotated Image."
+            )
+        )
+        menubar.add_cascade(label="Help", menu=help_menu)
+
+        # ---------- MAIN CONTAINER ----------
+        # Prevent geometry manager conflict
+        main_container = tk.Frame(self, bg="#f4f4f4")
+        main_container.pack(fill="both", expand=True)
+
+        # Workspace split: left tabs + right canvas
+        workspace = tk.Frame(main_container, bg="#f4f4f4")
+        workspace.pack(fill="both", expand=True)
+
+        workspace.grid_rowconfigure(0, weight=1)
+        workspace.grid_columnconfigure(1, weight=1)
+
+        # Left panel (tabs)
+        left_panel = tk.Frame(workspace, bg="#ffffff", width=320)
+        left_panel.grid(row=0, column=0, sticky="ns")
+        left_panel.grid_propagate(False)
+
+        self.tabs = CaptureTabUI(left_panel, self)
+        self.tabs.pack(fill="both", expand=True)
+
+        # Right side: canvas
+        canvas_frame = tk.Frame(workspace, bg="#000")
         canvas_frame.grid(row=0, column=1, sticky="nsew")
         canvas_frame.grid_rowconfigure(0, weight=1)
         canvas_frame.grid_columnconfigure(0, weight=1)
+
         self.canvas = tk.Canvas(canvas_frame, bg="#222", highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
+
+        workspace.grid_rowconfigure(0, weight=1)
+        workspace.grid_columnconfigure(0, weight=0)
+        workspace.grid_columnconfigure(1, weight=1)
+
+        # ---------- CANVAS ----------
+        canvas_frame = tk.Frame(workspace, bg="#000")
+        canvas_frame.grid(row=0, column=1, sticky="nsew")
+
+        self.canvas = tk.Canvas(canvas_frame, bg="#222", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+
         self.canvas.bind("<Button-1>", self.on_canvas_click)
         self.canvas.bind("<Configure>", self.on_canvas_resize)
+        self.canvas.bind("<MouseWheel>", self.on_mousewheel)
+        self.canvas.bind("<Button-4>", self.on_mousewheel_linux)
+        self.canvas.bind("<Button-5>", self.on_mousewheel_linux)
 
-        self.tangent_lines = {}             # {"left": ((ix,iy),(ix,iy)), "right": ...} in image coords
-        self.manual_tangent_mode = False
+        # ---------- LEFT VERTICAL TABS ----------
 
-        # bottom help label
-        self.help_label = tk.Label(self, text="Click points on the droplet edge. Baseline can be auto-detected or set manually.",
-                                   bg="#f4f4f4")
-        self.help_label.grid(row=1, column=0, columnspan=2, sticky="we")
+        left_frame = tk.Frame(workspace, bg="#f0f0f0", width=260)
+        left_frame.grid(row=0, column=0, sticky="ns")
 
-    # --------------------- Image loading / rendering ---------------------
+        self.tab_panel = CaptureTabUI(left_frame, self)
+        self.tab_panel.grid(row=0, column=0, sticky="nsew")
+
+        # ---------- MOVE CONTROLS ----------
+        self.setup_move_controls()
+
+        # ---------- HELP LABEL ----------
+        self.help_label = tk.Label(
+            main_container,
+            text="Click points on the droplet edge. Baseline can be auto-detected or set manually.",
+            bg="#f4f4f4"
+        )
+        self.help_label.pack(fill="x", side="bottom")
+
+    def on_mousewheel(self, event):
+        """Zoo`m image with mouse wheel (Windows/macOS)."""
+        if self.orig_image is None:
+            return
+        # Prevent resize-triggered double render
+        self._zooming = True
+
+        factor = 1.1 if event.delta > 0 else 0.9
+        self.zoom(factor)
+
+        self._zooming = False
+
+    def on_mousewheel_linux(self, event):
+        """Zoom handler for Linux systems."""
+        if self.orig_image is None:
+            return
+        factor = 1.1 if event.num == 4 else 1 / 1.1
+        self.zoom(factor)
+
     def load_image(self):
         path = filedialog.askopenfilename(filetypes=[("Image files","*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff")])
         if not path:
@@ -126,38 +183,58 @@ class ContactAngleApp(tk.Tk):
         self.render_image_on_canvas()
 
     def render_image_on_canvas(self):
+        """Re-render the image on canvas with correct panning (offset) and zoom handling."""
         if self.orig_image is None:
             return
 
-        # Canvas size
-        canvas_w = self.canvas.winfo_width() or 900
+        if getattr(self, "_rendering", False):
+            return
+        self._rendering = True
+
+        # Canvas dimensions
+        canvas_w = self.canvas.winfo_width() or 1200
         canvas_h = self.canvas.winfo_height() or 600
 
-        # Original image size
-        img_w, img_h = self.orig_image.size
+        rgb = cv2.cvtColor(self.cv_image, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
 
-        # Scale to fit full width (maintain aspect ratio)
-        ratio = canvas_w / img_w
-        new_w = canvas_w
-        new_h = int(img_h * ratio)
+        # Apply zoom
+        img_w, img_h = pil.size
+        new_w = int(img_w * self.scale)
+        new_h = int(img_h * self.scale)
+        display_image = pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-        # Resize image
-        self.display_image = self.orig_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        
+        # Center image if not yet panned
+        if not self.user_panned:
+            self.offset = ((canvas_w - new_w) // 2, (canvas_h - new_h) // 2)
 
-        # Compute offsets — horizontally no offset, vertically center if image is shorter than canvas
-        self.scale = ratio
-        self.offset = (0, (canvas_h - new_h) // 2 if canvas_h > new_h else 0)
+        # Render image at current offset safely
+        if display_image is not None:
+            self.tk_image = ImageTk.PhotoImage(display_image)
+            self.canvas.delete("all")
+            self.canvas.create_image(self.offset[0], self.offset[1], anchor="nw", image=self.tk_image, tags="bg")
+            self.canvas.image = self.tk_image  # keep reference
+        else:
+            print("⚠️ render_image_on_canvas: display_image was None (skipping draw)")
 
-        # Show image
-        self.tk_image = ImageTk.PhotoImage(self.display_image)
-        self.canvas.delete("all")
-        self.canvas.create_image(self.offset[0], self.offset[1], anchor="nw", image=self.tk_image, tags="bg")
-        # Draw overlays (points, baseline, etc.)
-        self.draw_overlay_on_canvas()
+        # Ensure reference persistence
+        self.canvas.image = self.tk_image
+
+        # Draw overlays (baseline, tangents, points, etc.)
+        if hasattr(self, "draw_overlay_on_canvas"):
+            try:
+                self.draw_overlay_on_canvas()
+            except Exception:
+                pass
+
+        self._rendering = False
 
     def on_canvas_resize(self, event):
-        if self.orig_image:
-            self.render_image_on_canvas()
+        """Redraw when canvas size changes (not during zoom)."""
+        if getattr(self, "_zooming", False):
+            return  # skip redundant render during zoom
+        self.render_image_on_canvas()
 
     def canvas_to_image_coords(self, cx, cy):
         ox, oy = self.offset
@@ -277,7 +354,6 @@ class ContactAngleApp(tk.Tk):
             # If user previously placed P3/P4, remove them (keep P1,P2 only)
             if len(self.points) > 2:
                 self.points = self.points[:2]
-                self.status_label.config(text=f"Points: {len(self.points)}/4")
 
         # Remove temporary rubber-band line and reset state
         if getattr(self, "_current_line", None) is not None:
@@ -291,7 +367,6 @@ class ContactAngleApp(tk.Tk):
         # redraw overlays now that tangent_lines has image-coord tangents
         self.draw_overlay_on_canvas()
 
-    # --------------------- Point selection ---------------------
     def on_canvas_click(self, event):
     # standard point selection for baseline/tangents
         if self.orig_image is None:
@@ -318,10 +393,9 @@ class ContactAngleApp(tk.Tk):
 
         if len(self.points) < 2:
             self.points.append((ix, iy))
-            self.status_label.config(text=f"Points: {len(self.points)}/4")
             if len(self.points) == 2:
                 # Create baseline from first two clicks
-                self.baseline = (*self.points[0], *self.points[1])
+                self.draw_long_baseline(self.points[0], self.points[1])
                 self.draw_overlay_on_canvas()
                 self.help_label.config(text="Baseline created. Now click 2 more points (P3,P4) on droplet edge.")
             else:
@@ -331,7 +405,6 @@ class ContactAngleApp(tk.Tk):
 
         if len(self.points) < 4:
             self.points.append((ix, iy))
-            self.status_label.config(text=f"Points: {len(self.points)}/4")
             self.draw_overlay_on_canvas()
             if len(self.points) == 4:
                 self.compute_angle()
@@ -344,10 +417,27 @@ class ContactAngleApp(tk.Tk):
         self.baseline = None
         self.last_result = None
         self.tangent_lines = {}
-        self.result_label.config(text="Left Angle: —\nRight Angle: —")
-        self.status_label.config(text="Points: 0/4")
-        if self.orig_image:
-            self.render_image_on_canvas()
+
+        # Reset all tangent/baseline-related modes and flags
+        self.manual_tangent_mode = False
+        self.manual_tangents_finalized = False
+        self.expecting_second_tangent_point = False
+        self.adjusting_baseline = False
+
+        # Update UI labels
+        self.tabs.result_label.config(text="Left Angle: —\nRight Angle: —")
+        self.help_label.config(text="Click 2 points to create a baseline, then 2 points for tangents.")
+
+        # Remove everything from the canvas and redraw only the background image
+        self.canvas.delete("all")
+
+        # Recreate the background image (keep reference so Tk doesn't GC it)
+        if getattr(self, "tk_image", None) is not None:
+            self.canvas.create_image(self.offset[0], self.offset[1],
+                                     anchor="nw", image=self.tk_image, tags="bg")
+
+        # Ensure overlays (none) get drawn consistently
+        self.draw_overlay_on_canvas()
 
     def detect_baseline_auto(self):
         """
@@ -389,14 +479,25 @@ class ContactAngleApp(tk.Tk):
             messagebox.showwarning("Detection failed", "No horizontal baseline found.")
             return False
 
-        # choose the lowest (largest average y) horizontal line
-        chosen = max(horiz, key=lambda L: (L[1] + L[3]) / 2.0)
+        def safe_len(L):
+            try:
+                return math.hypot(L[2] - L[0], L[3] - L[1])
+            except:
+                return -1   # invalid line, ignore
+
+        valid_lines = [L for L in lines if len(L) >= 4]
+
+        if not valid_lines:
+            messagebox.showerror("Auto Baseline Error", "Unable to detect valid baseline lines.")
+            return
+
+        chosen = max(valid_lines, key=safe_len)
+
         self.baseline = chosen
         messagebox.showinfo("Baseline Detected", "Automatic baseline detected (lower 25%).")
         self.draw_overlay_on_canvas()
         return True
 
-    # --------------------- Drawing overlays ---------------------
     def draw_overlay_on_canvas(self):
         """
         Draw overlays on the canvas:
@@ -414,7 +515,6 @@ class ContactAngleApp(tk.Tk):
             self.canvas.create_image(self.offset[0], self.offset[1],
                                     anchor="nw", image=self.tk_image, tags="bg")
 
-        # ----------------- Draw baseline -----------------
         if self.baseline is not None:
             x1, y1, x2, y2 = self.baseline
             c1 = self.image_to_canvas_coords(x1, y1)
@@ -436,7 +536,6 @@ class ContactAngleApp(tk.Tk):
             except Exception:
                 pass
 
-        # ----------------- Draw user points -----------------
         for i, (ix, iy) in enumerate(self.points):
             cx, cy = self.image_to_canvas_coords(ix, iy)
             r = 6
@@ -446,7 +545,6 @@ class ContactAngleApp(tk.Tk):
             self.canvas.create_text(cx + 10, cy - 10, text=f"P{i+1}",
                                     fill="white", font=("Arial", 9), tags="overlay")
 
-        # ----------------- Draw point-based tangents -----------------
         if len(self.points) >= 4:
             p1 = np.array(self.points[0])
             p2 = np.array(self.points[1])
@@ -459,7 +557,6 @@ class ContactAngleApp(tk.Tk):
             self._draw_line_through_point_canvas(tuple(p2), p4 - p2,
                                                 color="orange", width=2)
 
-        # ----------------- Draw manually drawn tangents -----------------
         for key, pts in self.tangent_lines.items():
             (xA, yA), (xB, yB) = pts
             cA = self.image_to_canvas_coords(xA, yA)
@@ -467,7 +564,6 @@ class ContactAngleApp(tk.Tk):
             self.canvas.create_line(cA[0], cA[1], cB[0], cB[1],
                                     fill="orange", width=3, tags="overlay")
 
-        # ----------------- Draw angle text near contact points -----------------
         if self.last_result:
             for side in ("left", "right"):
                 if side not in self.last_result:
@@ -479,7 +575,7 @@ class ContactAngleApp(tk.Tk):
                 offset_y = -25
                 self.canvas.create_text(cx + offset_x, cy + offset_y,
                                         text=ang_text,
-                                        fill="white",
+                                        fill="blue",
                                         font=("Arial", 12, "bold"),
                                         tags="overlay")
 
@@ -496,8 +592,65 @@ class ContactAngleApp(tk.Tk):
         c2 = self.image_to_canvas_coords(*p2)
         self.canvas.create_line(c1[0], c1[1], c2[0], c2[1], fill=color, width=width, tags="overlay")
 
-    # --------------------- Geometry & angle computation ---------------------
+    def draw_long_baseline(self, p1, p2, color="cyan", width=2):
+        """Draw an extended baseline through two points, checking if they are roughly horizontal."""
+        x1, y1 = map(int, p1)
+        x2, y2 = map(int, p2)
+        self.canvas.create_line(x1, y1, x2, y2, fill="lime", width=2)
+
+        # Check if both points are roughly in a straight line (horizontal tolerance)
+        # if abs(y2 - y1) > 5:  # you can adjust tolerance (10 px for now)
+        #     messagebox.showerror(
+        #         "Baseline Error",
+        #         "Both points are not in a straight line.\nPlease try again."
+        #     )
+        #     self.points.clear()
+        #     self.baseline = None
+        #     self.draw_overlay_on_canvas()
+        #     return
+
+        # Compute line vector and extend it across image width
+        img_w, img_h = self.orig_image.size
+        dx = x2 - x1
+        dy = y2 - y1
+        if abs(dx) < 1e-7:
+            # vertical line edge case
+            x_left, y_left = x1, 0
+            x_right, y_right = x1, img_h
+        else:
+            slope = dy / dx
+            intercept = y1 - slope * x1
+            x_left, x_right = 0, img_w
+            y_left = slope * x_left + intercept
+            y_right = slope * x_right + intercept
+
+        # Save as baseline
+        self.baseline = (x_left, y_left, x_right, y_right)
+
+        # Draw it on canvas
+        c1 = self.image_to_canvas_coords(x_left, y_left)
+        c2 = self.image_to_canvas_coords(x_right, y_right)
+        self.canvas.create_line(
+            c1[0], c1[1], c2[0], c2[1],
+            fill=color, width=width, tags="overlay"
+        )
+
+    def validate_baseline_points(self, p1, p2, min_distance=2):
+        """
+        Accept baseline of ANY angle. Only check that the two points are not
+        almost identical.
+        """
+        x1, y1 = p1
+        x2, y2 = p2
+        dist = math.hypot(x2 - x1, y2 - y1)
+
+        if dist < min_distance:
+            return False, "Both points are too close to form a straight line."
+
+        return True, None
+
     def compute_angle(self):
+        # basic prechecks
         if len(self.points) < 2 and self.baseline is None:
             messagebox.showwarning("Missing points", "Need at least baseline info (two points or detected baseline).")
             return
@@ -506,6 +659,7 @@ class ContactAngleApp(tk.Tk):
             messagebox.showwarning("Missing baseline", "Baseline is not set. Either click 2 baseline points or run Detect Baseline.")
             return
 
+        # baseline vector (image coords)
         (x1, y1, x2, y2) = self.baseline
         base_vec = np.array([x2 - x1, y2 - y1], dtype=float)
         base_len = np.linalg.norm(base_vec)
@@ -514,58 +668,144 @@ class ContactAngleApp(tk.Tk):
             return
         base_vec /= base_len
 
-        # ---------------- Tangent Vectors ----------------
+        # helpers
+        def line_intersection(pA, pB, pC, pD):
+            """Return intersection of segment AB and CD as (x,y) or None if parallel."""
+            x1,y1 = pA; x2,y2 = pB
+            x3,y3 = pC; x4,y4 = pD
+            denom = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
+            if abs(denom) < 1e-9:
+                return None
+            px = ((x1*y2 - y1*x2)*(x3-x4) - (x1-x2)*(x3*y4 - y3*x4)) / denom
+            py = ((x1*y2 - y1*x2)*(y3-y4) - (y1-y2)*(x3*y4 - y3*x4)) / denom
+            return (px, py)
+
+        # compute manual tangent vectors (if present)
         tanL = None
         tanR = None
+        contactL = None
+        contactR = None
 
-        # Manual tangents have highest priority
         if self.tangent_lines.get("left"):
-            pL1, pL2 = np.array(self.tangent_lines["left"][0]), np.array(self.tangent_lines["left"][1])
-            v = pL2 - pL1
-            if np.linalg.norm(v) > 1e-7:
+            L1, L2 = self.tangent_lines["left"]
+            v = np.array(L2) - np.array(L1)
+            if np.linalg.norm(v) > 1e-9:
                 tanL = v / np.linalg.norm(v)
-        if self.tangent_lines.get("right"):
-            pR1, pR2 = np.array(self.tangent_lines["right"][0]), np.array(self.tangent_lines["right"][1])
-            v2 = pR2 - pR1
-            if np.linalg.norm(v2) > 1e-7:
-                tanR = v2 / np.linalg.norm(v2)
 
-        # Fallback to 4-point mode if manual tangents missing
-        if tanL is None and len(self.points) >= 3:
-            p1 = np.array(self.points[0])
-            p3 = np.array(self.points[2])
-            v = p3 - p1
-            if np.linalg.norm(v) > 1e-7:
-                tanL = v / np.linalg.norm(v)
-        if tanR is None and len(self.points) >= 4:
-            p2 = np.array(self.points[1])
-            p4 = np.array(self.points[3])
-            v = p2 - p4
-            if np.linalg.norm(v) > 1e-7:
+        if self.tangent_lines.get("right"):
+            R1, R2 = self.tangent_lines["right"]
+            v = np.array(R2) - np.array(R1)
+            if np.linalg.norm(v) > 1e-9:
                 tanR = v / np.linalg.norm(v)
 
-        # ---------------- Angle Calculation ----------------
-        def angle_from_baseline(bv, tv):
-            """Returns corrected acute angle (0–90°) between baseline and tangent."""
+        # If manual tangents exist, prefer using the intersection between tangent line and baseline as contact
+        base_p1 = (x1, y1); base_p2 = (x2, y2)
+        if self.tangent_lines.get("left"):
+            L1, L2 = self.tangent_lines["left"]
+            inter = line_intersection(base_p1, base_p2, tuple(L1), tuple(L2))
+            if inter is None:
+                messagebox.showerror("Tangent Error", "Left tangent does not touch baseline.")
+                return
+            contactL = inter
+
+        if self.tangent_lines.get("right"):
+            R1, R2 = self.tangent_lines["right"]
+            inter = line_intersection(base_p1, base_p2, tuple(R1), tuple(R2))
+            if inter is None:
+                messagebox.showerror("Tangent Error", "Right tangent does not touch baseline.")
+                return
+            contactR = inter
+
+        # Fallback: if manual tangents missing, try 4-point mode to compute tangent vectors
+        if tanL is None and len(self.points) >= 3:
+            p1 = np.array(self.points[0]); p3 = np.array(self.points[2])
+            v = p3 - p1
+            if np.linalg.norm(v) > 1e-9:
+                tanL = v / np.linalg.norm(v)
+
+        if tanR is None and len(self.points) >= 4:
+            p2 = np.array(self.points[1]); p4 = np.array(self.points[3])
+            v = p4 - p2
+            if np.linalg.norm(v) > 1e-9:
+                tanR = v / np.linalg.norm(v)
+
+        # Determine contact points if not already set by intersection:
+        if contactL is None:
+            # if user clicked P1 use it; otherwise if tangent exists use tangent start as fallback
+            if len(self.points) >= 1:
+                contactL = tuple(self.points[0])
+            elif self.tangent_lines.get("left"):
+                contactL = tuple(self.tangent_lines["left"][0])
+
+        if contactR is None:
+            if len(self.points) >= 2:
+                contactR = tuple(self.points[1])
+            elif self.tangent_lines.get("right"):
+                contactR = tuple(self.tangent_lines["right"][0])
+
+        # Build pts_for_center as before (include contact points and midpoints of tangents if present)
+        pts_for_center = []
+        if len(self.points) >= 4:
+            pts_for_center.extend([np.array(self.points[0]), np.array(self.points[1]),
+                                np.array(self.points[2]), np.array(self.points[3])])
+        elif len(self.points) >= 3:
+            pts_for_center.extend([np.array(self.points[0]), np.array(self.points[2])])
+        elif len(self.points) >= 2:
+            pts_for_center.extend([np.array(self.points[0]), np.array(self.points[1])])
+
+        if self.tangent_lines.get("left"):
+            a,b = np.array(self.tangent_lines["left"][0]), np.array(self.tangent_lines["left"][1])
+            pts_for_center.append((a+b)/2.0)
+        if self.tangent_lines.get("right"):
+            a,b = np.array(self.tangent_lines["right"][0]), np.array(self.tangent_lines["right"][1])
+            pts_for_center.append((a+b)/2.0)
+
+        # if contact points are available include them for more accurate center
+        if contactL is not None:
+            pts_for_center.append(np.array(contactL))
+        if contactR is not None:
+            pts_for_center.append(np.array(contactR))
+
+        if pts_for_center:
+            center = np.mean(np.stack(pts_for_center, axis=0), axis=0)
+        else:
+            center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
+
+        def orient_tangent(tan_vec, contact_pt):
+            if tan_vec is None or contact_pt is None:
+                return None
+            r = center - np.array(contact_pt)
+            n = np.array([-tan_vec[1], tan_vec[0]])
+            if np.dot(n, r) < 0:
+                return -tan_vec
+            return tan_vec
+
+        # Orient tangents using the contact points computed above
+        tanL = orient_tangent(tanL, contactL)
+        tanR = orient_tangent(tanR, contactR)
+
+        # angle helper (fixed to return value)
+        def angle_from_baseline_full(bv, tv):
+            if tv is None:
+                return None
             cross = np.cross(bv, tv)
             dot = np.dot(bv, tv)
-            raw_angle = abs(np.degrees(math.atan2(cross, dot)))
-            if raw_angle > 90:
-                raw_angle = 180 - raw_angle
-            return raw_angle
+            angle = abs(np.degrees(math.atan2(cross, dot)))
+            if angle < 0:
+                angle += 180.0
+            return angle
 
-        left_angle = angle_from_baseline(base_vec, tanL) if tanL is not None else None
-        right_angle = angle_from_baseline(base_vec, tanR) if tanR is not None else None
+        left_angle = angle_from_baseline_full(base_vec, tanL)
+        right_angle = angle_from_baseline_full(base_vec, tanR)
 
-        # ---------------- Store + Display ----------------
+        # store results using the actual contact points (intersection or fallbacks)
         self.last_result = {}
-        if left_angle is not None and len(self.points) >= 1:
-            self.last_result["left"] = {"contact": tuple(self.points[0]),
-                                        "angle_deg": left_angle, "tan_vec": tanL, "perp_vec": base_vec}
-        if right_angle is not None and len(self.points) >= 2:
-            self.last_result["right"] = {"contact": tuple(self.points[1]),
-                                        "angle_deg": right_angle, "tan_vec": tanR, "perp_vec": base_vec}
+        if left_angle is not None and contactL is not None:
+            self.last_result["left"] = {"contact": tuple(contactL), "angle_deg": left_angle, "tan_vec": tanL, "perp_vec": base_vec}
+        if right_angle is not None and contactR is not None:
+            self.last_result["right"] = {"contact": tuple(contactR), "angle_deg": right_angle, "tan_vec": tanR, "perp_vec": base_vec}
 
+        # UI label text as before
         text = []
         if left_angle is not None:
             text.append(f"Left Angle: {left_angle:.2f}°")
@@ -573,9 +813,17 @@ class ContactAngleApp(tk.Tk):
             text.append(f"Right Angle: {right_angle:.2f}°")
         if not text:
             text = ["No tangents available to compute angles."]
-        self.result_label.config(text="\n".join(text))
+        # Write to CaptureTabUI result label if present
+        try:
+            self.tabs.result_label.config(text="\n".join(text))
+        except Exception:
+            pass
 
-        self.draw_overlay_on_canvas()
+        # redraw overlays to show results
+        try:
+            self.draw_overlay_on_canvas()
+        except Exception:
+            pass
 
     def _angle_between_vectors_deg(self, a, b):
         a = np.array(a, dtype=float)
@@ -589,7 +837,6 @@ class ContactAngleApp(tk.Tk):
         ang = math.degrees(math.acos(cosv))
         return ang
 
-    # --------------------- Save annotated ---------------------
     def save_annotated(self):
         if self.orig_image is None:
             messagebox.showwarning("No image", "Load image first.")
@@ -598,60 +845,67 @@ class ContactAngleApp(tk.Tk):
             messagebox.showwarning("No result", "Compute angles first.")
             return
 
+        # Work directly on a copy of the original image
         out = self.orig_image.copy()
         draw = ImageDraw.Draw(out)
 
-        # draw baseline (image coords)
+        # ---- Draw overlays ----
         if self.baseline is not None:
             x1, y1, x2, y2 = self.baseline
-            draw.line([(x1, y1), (x2, y2)], fill=(255,255,255), width=3)
+            draw.line([(x1, y1), (x2, y2)], fill=(0, 255, 0), width=3)
 
-        # helper to draw long line on PIL image
-        def draw_line_pil(pt, vec, length=1000, fill=(255,165,0), width=6):
+        def draw_line_pil(pt, vec, base_length=150, fill=(255,165,0), width=6):
             v = np.array(vec, dtype=float)
             if np.linalg.norm(v) < 1e-7:
                 return
             v_unit = v / np.linalg.norm(v)
-            half = v_unit * (length/2.0)
-            p1 = (pt[0]-half[0], pt[1]-half[1])
-            p2 = (pt[0]+half[0], pt[1]+half[1])
+            half = v_unit * (base_length / 2.0)
+            p1 = (pt[0] - half[0], pt[1] - half[1])
+            p2 = (pt[0] + half[0], pt[1] + half[1])
             draw.line([tuple(p1), tuple(p2)], fill=fill, width=width)
 
-        # draw user points
+        # Draw points
         for i, (x, y) in enumerate(self.points):
             r = 8
-            color = (255,0,0) if i in (0,1) else (0,255,255)
-            draw.ellipse([ (x-r,y-r),(x+r,y+r) ], fill=color, outline=(0,0,0))
-            draw.text((x+8,y-10), f"P{i+1}", fill=(255,255,255))
+            color = (255, 0, 0) if i in (0, 1) else (0, 255, 255)
+            draw.ellipse([(x - r, y - r), (x + r, y + r)], fill=color, outline=(0, 0, 0))
+            draw.text((x + 8, y - 10), f"P{i+1}", fill=(255, 255, 255))
 
-        # draw tangents/perps from last_result
+        # Draw left and right lines
         if "left" in self.last_result:
             left = self.last_result["left"]
-            draw_line_pil(left["contact"], left["perp_vec"], length=800, fill=(0,255,0), width=4)
-            draw_line_pil(left["contact"], left["tan_vec"], length=800, fill=(255,165,0), width=4)
+            draw_line_pil(left["contact"], left["perp_vec"], base_length=150, fill=(0, 255, 0), width=4)
+            draw_line_pil(left["contact"], left["tan_vec"], base_length=150, fill=(255, 165, 0), width=4)
         if "right" in self.last_result:
             right = self.last_result["right"]
-            draw_line_pil(right["contact"], right["perp_vec"], length=800, fill=(0,255,0), width=4)
-            draw_line_pil(right["contact"], right["tan_vec"], length=800, fill=(255,165,0), width=4)
+            draw_line_pil(right["contact"], right["perp_vec"], base_length=150, fill=(0, 255, 0), width=4)
+            draw_line_pil(right["contact"], right["tan_vec"], base_length=150, fill=(255, 165, 0), width=4)
 
-        # draw angle text overlay
-        txt = []
+        # ===== Add CA left/right text at top of image =====
         if "left" in self.last_result:
-            txt.append(f"Left: {self.last_result['left']['angle_deg']:.2f}°")
-        if "right" in self.last_result:
-            txt.append(f"Right: {self.last_result['right']['angle_deg']:.2f}°")
-        draw.text((10,10), "    ".join(txt), fill=(255,255,255))
+            left_line = f"CA left: {self.last_result['left']['angle_deg']:.1f}°"
+            draw.text((10, 10), left_line, fill=(0, 0, 255))   # blue text
 
+        if "right" in self.last_result:
+            right_line = f"CA right: {self.last_result['right']['angle_deg']:.1f}°"
+            draw.text((10, 40), right_line, fill=(0, 0, 255))  # just below left
+
+        # ---- Save full-size annotated image ----
         initial = os.path.splitext(os.path.basename(self.image_path))[0] + "_annotated.png"
-        save_path = filedialog.asksaveasfilename(defaultextension=".png", initialfile=initial,
-                                                 filetypes=[("PNG","*.png"),("JPEG","*.jpg;*.jpeg")])
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            initialfile=initial,
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg;*.jpeg")]
+        )
         if not save_path:
             return
+
         try:
             out.save(save_path)
-            messagebox.showinfo("Saved", f"Annotated image saved to:\n{save_path}")
+            messagebox.showinfo("Saved", f"Full-size annotated image saved to:\n{save_path}")
         except Exception as e:
             messagebox.showerror("Save error", f"Could not save image:\n{e}")
+
     def zoom(self, factor):
         """Zoom the displayed image and overlays by given factor."""
         if self.orig_image is None:
@@ -667,11 +921,197 @@ class ContactAngleApp(tk.Tk):
         new_size = (int(w * self.scale), int(h * self.scale))
         self.display_image = self.orig_image.resize(new_size, Image.LANCZOS)
         self.tk_image = ImageTk.PhotoImage(self.display_image)
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor="nw", image=self.tk_image)
 
-        # Redraw overlays at new scale
+        # 🧹 Clear only old background image (not overlays)
+        self.canvas.delete("bg")
+
+        # 🖼️ Draw the new scaled image using current offset
+        ox, oy = self.offset
+        self.canvas.create_image(ox, oy, anchor="nw", image=self.tk_image, tags="bg")
+
+        # 🔁 Redraw overlays at new scale
         self.draw_overlay_on_canvas()
+
+    def setup_move_controls(self):
+        """Adds a Move/Drag button for panning the image."""
+        self.move_mode = False
+        self._drag_start = None
+        self.user_panned = False
+
+        # Find the left control panel
+        control_frame = None
+        for child in self.winfo_children():
+            info = child.grid_info()
+            if info and info.get("column") == 0:
+                control_frame = child
+                break
+
+        if not control_frame:
+            return
+
+        # Create toggle button
+        btn_move = tk.Button(
+            control_frame,
+            text="Move Image (OFF)",
+            width=28,
+            command=self.toggle_move_mode
+        )
+        btn_move.pack(pady=8)
+        self.tabs.move_button = btn_move
+
+    def redraw_overlays(self):
+        """Redraw markers like points, baseline, tangents, etc."""
+        for i, (x, y) in enumerate(self.points):
+            self.canvas.create_oval(x-3, y-3, x+3, y+3, outline="red", width=2)
+        if self.baseline:
+            x1, y1, x2, y2 = self.baseline
+            self.canvas.create_line(x1, y1, x2, y2, fill="cyan", width=2, tags="overlay")
+
+    def reset_image_view(self):
+        """Reset zoom, pan, and redraw image as originally loaded."""
+        if self.orig_image is None:
+            return  # nothing to reset
+
+        # Reset zoom/pan state
+        self.offset = (0, 0)
+        self.user_panned = False
+
+        # Re-render image fresh
+        self.render_image_on_canvas()
+
+        # Update help label (optional)
+        self.help_label.config(text="Image view has been reset to default.")
+
+    def enable_manual_baseline_draw(self):
+        """Activate manual baseline drawing mode — replaces any auto baseline."""
+        # --- Remove any visible overlays (auto-detected baseline, tangent lines, etc.) ---
+        try:
+            self.canvas.delete("overlay")
+            self.canvas.delete("baseline")
+        except Exception:
+            pass
+
+        # --- Clear previous stored baselines (both logical and drawn) ---
+        self.baseline = None
+        if hasattr(self, "baseline_line") and self.baseline_line:
+            try:
+                self.canvas.delete(self.baseline_line)
+            except Exception:
+                pass
+            self.baseline_line = None
+
+        # --- Also clear auto baseline line if it was separately stored ---
+        if hasattr(self, "auto_baseline_line") and self.auto_baseline_line:
+            try:
+                self.canvas.delete(self.auto_baseline_line)
+            except Exception:
+                pass
+            self.auto_baseline_line = None
+
+        # --- Activate manual baseline drawing mode ---
+        self.manual_baseline_mode = True
+        self.canvas.config(cursor="crosshair")
+
+        # --- Bind handlers for drawing ---
+        self.canvas.bind("<ButtonPress-1>", self.on_manual_baseline_click)
+        self.canvas.bind("<B1-Motion>", self.draw_manual_baseline)
+        self.canvas.bind("<ButtonRelease-1>", self.finish_manual_baseline)
+
+        if hasattr(self, "help_label"):
+            self.help_label.config(
+                text="Draw manual baseline: click-drag across the slide (release to set)."
+            )
+
+
+    def on_manual_baseline_click(self, event):
+        """Handle first click for manual baseline (click–release method)."""
+        # Store start point
+        self.baseline_start = (self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+
+        # Delete any prior temporary or real baselines
+        self.canvas.delete("overlay")
+        if hasattr(self, "baseline_line") and self.baseline_line:
+            self.canvas.delete(self.baseline_line)
+            self.baseline_line = None
+
+
+    def draw_manual_baseline(self, event):
+        """Live preview while dragging the mouse."""
+        if not self.manual_baseline_mode or not hasattr(self, "baseline_start"):
+            return
+
+        x0, y0 = self.baseline_start
+        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+
+        # Delete old preview
+        self.canvas.delete("overlay")
+
+        # Draw live preview (white dashed line)
+        self.baseline_line = self.canvas.create_line(
+            x0, y0, x1, y1, fill="white", width=2, dash=(4, 2), tags=("overlay", "baseline_preview")
+        )
+
+
+    def finish_manual_baseline(self, event):
+        """Finalize manual baseline when user releases the mouse."""
+        if not self.manual_baseline_mode or not hasattr(self, "baseline_start"):
+            return
+
+        # Coordinates
+        x0c, y0c = self.baseline_start
+        x1c, y1c = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+
+        # Clean preview
+        self.canvas.delete("overlay")
+
+        # Convert to image coordinates
+        p1_img = self.canvas_to_image_coords(x0c, y0c)
+        p2_img = self.canvas_to_image_coords(x1c, y1c)
+
+        # ---- NEW BASELINE VALIDATION ----
+        valid, msg = self.validate_baseline_points(p1_img, p2_img)
+        if not valid:
+            messagebox.showerror("Invalid Baseline", msg)
+            self.manual_baseline_mode = False
+            self.canvas.config(cursor="arrow")
+            return
+
+        # --- Draw new persistent manual baseline ---
+        try:
+            self.draw_long_baseline(p1_img, p2_img, color="orange", width=2)
+        except Exception:
+            self.baseline = (p1_img[0], p1_img[1], p2_img[0], p2_img[1])
+            self.baseline_line = self.canvas.create_line(
+                x0c, y0c, x1c, y1c, fill="orange", width=2, tags="baseline"
+            )
+
+        # --- Ensure overlays update ---
+        if hasattr(self, "draw_overlay_on_canvas"):
+            self.draw_overlay_on_canvas()
+
+        # --- Disable manual mode ---
+        self.manual_baseline_mode = False
+        self.canvas.config(cursor="arrow")
+
+        # Unbind drawing handlers
+        self.canvas.unbind("<ButtonPress-1>")
+        self.canvas.unbind("<B1-Motion>")
+        self.canvas.unbind("<ButtonRelease-1>")
+
+        if hasattr(self, "help_label"):
+            self.help_label.config(
+                text="Manual baseline set. You can now proceed to define tangents or compute angles."
+            )
+    def load_video(self):
+        video_path = filedialog.askopenfilename(
+            title="Select Video File",
+            filetypes=[("Video Files", "*.mp4;*.avi;*.mov;*.mkv"), ("All Files", "*.*")]
+        )
+        if not video_path:
+            return
+
+        self.video_path = video_path
+        messagebox.showinfo("Video Loaded", f"Loaded video:\n{os.path.basename(video_path)}")
 
 if __name__ == "__main__":
     app = ContactAngleApp()
